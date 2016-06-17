@@ -18,19 +18,37 @@ defmodule Verk.QueueTest do
   end
 
   test "count empty queue" do
-    assert count(@queue) == 0
+    assert count(@queue) == {:ok, 0}
   end
 
   test "count" do
     Redix.command!(Verk.Redis, ~w(LPUSH #{@queue_key} 1 2 3))
 
-    assert count(@queue) == 3
+    assert count(@queue) == {:ok, 3}
+  end
+
+  test "count!" do
+    Redix.command!(Verk.Redis, ~w(LPUSH #{@queue_key} 1 2 3))
+
+    assert count!(@queue) == 3
   end
 
   test "clear" do
+    assert clear(@queue) == {:ok, false}
+
     Redix.command!(Verk.Redis, ~w(LPUSH #{@queue_key} 1 2 3))
 
-    assert clear(@queue)
+    assert clear(@queue) == {:ok, true}
+
+    assert Redix.command!(Verk.Redis, ~w(GET #{@queue_key})) == nil
+  end
+
+  test "clear!" do
+    assert clear!(@queue) == false
+
+    Redix.command!(Verk.Redis, ~w(LPUSH #{@queue_key} 1 2 3))
+
+    assert clear!(@queue) == true
 
     assert Redix.command!(Verk.Redis, ~w(GET #{@queue_key})) == nil
   end
@@ -40,29 +58,60 @@ defmodule Verk.QueueTest do
     json = Poison.encode!(job)
     Redix.command!(Verk.Redis, ~w(LPUSH #{@queue_key} #{json}))
 
-    assert range(@queue) == [%{ job | original_json: json }]
+    assert range(@queue) == {:ok, [%{ job | original_json: json }]}
   end
 
   test "range with no items" do
-    assert range(@queue) == []
+    assert range(@queue) == {:ok, []}
+  end
+
+  test "range!" do
+    assert range!(@queue) == []
   end
 
   test "delete_job having job with original_json" do
     job = %Verk.Job{class: "Class", args: []}
     json = Poison.encode!(job)
 
+    assert delete_job(@queue, job) == {:ok, false}
+
     Redix.command!(Verk.Redis, ~w(LPUSH #{@queue_key} #{json}))
 
     job = %{ job | original_json: json}
 
-    assert delete_job(@queue, job) == true
+    assert delete_job(@queue, job) == {:ok, true}
+  end
+
+  test "delete_job! having job with original_json" do
+    job = %Verk.Job{class: "Class", args: []}
+    json = Poison.encode!(job)
+
+    assert delete_job!(@queue, job) == false
+
+    Redix.command!(Verk.Redis, ~w(LPUSH #{@queue_key} #{json}))
+
+    job = %{ job | original_json: json}
+
+    assert delete_job!(@queue, job) == true
   end
 
   test "delete_job with original_json" do
     json = %Verk.Job{class: "Class", args: []} |> Poison.encode!
 
+    assert delete_job(@queue, json) == {:ok, false}
+
     Redix.command!(Verk.Redis, ~w(LPUSH #{@queue_key} #{json}))
 
-    assert delete_job(@queue, json) == true
+    assert delete_job(@queue, json) == {:ok, true}
+  end
+
+  test "delete_job! with original_json" do
+    json = %Verk.Job{class: "Class", args: []} |> Poison.encode!
+
+    assert delete_job!(@queue, json) == false
+
+    Redix.command!(Verk.Redis, ~w(LPUSH #{@queue_key} #{json}))
+
+    assert delete_job!(@queue, json) == true
   end
 end

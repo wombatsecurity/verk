@@ -5,6 +5,14 @@ defmodule Verk.Worker do
   use GenServer
   require Logger
 
+  @process_dict_key :verk_current_job
+
+  @doc """
+  Get the current job that the worker is running
+  """
+  @spec current_job :: %Verk.Job{}
+  def current_job, do: :erlang.get(@process_dict_key)
+
   @doc false
   def start_link(args \\ []) do
     GenServer.start_link(__MODULE__, args)
@@ -13,23 +21,24 @@ defmodule Verk.Worker do
   @doc """
   Ask the worker to perform the job
   """
-  @spec perform_async(pid, pid, atom, list(term), binary) :: :ok
-  def perform_async(worker, manager, module, args, job_id) do
-    GenServer.cast(worker, { :perform, module, args, job_id, manager })
+  @spec perform_async(pid, pid, %Verk.Job{}) :: :ok
+  def perform_async(worker, manager, job) do
+    GenServer.cast(worker, {:perform, job, manager})
   end
 
   @doc false
-  def init(_args \\ []), do: { :ok, nil }
+  def init(_args \\ []), do: {:ok, nil}
 
   @doc false
-  def handle_cast({ :perform, module, args, job_id, manager }, state) do
+  def handle_cast({:perform, job, manager}, state) do
     try do
-      apply(String.to_atom("Elixir.#{module}"), :perform, args)
-      GenServer.cast(manager, { :done, self, job_id })
-      { :stop, :normal, state }
+      :erlang.put(@process_dict_key, job)
+      [job.class] |> Module.safe_concat |> apply(:perform, job.args)
+      GenServer.cast(manager, {:done, self, job.jid})
+      {:stop, :normal, state}
     rescue
-      exception -> GenServer.cast(manager, { :failed, self, job_id, exception, System.stacktrace })
-      { :stop, :failed, state }
+      exception -> GenServer.cast(manager, {:failed, self, job.jid, exception, System.stacktrace})
+      {:stop, :failed, state}
     end
   end
 end

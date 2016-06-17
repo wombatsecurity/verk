@@ -31,14 +31,13 @@ Feature set:
 * Reliable job processing (RPOPLPUSH and Lua scripts to the rescue)
 * Error and event tracking
 
-
 ## Installation
 
 First, add Verk to your `mix.exs` dependencies:
 
 ```elixir
 def deps do
-  [{:verk, "~> 0.9"}]
+  [{:verk, "~> 0.12"}]
 end
 ```
 
@@ -48,6 +47,21 @@ application dependency:
 ```elixir
 def application do
   [applications: [:verk]]
+end
+```
+
+Finally add `Verk.Supervisor` to your supervision tree:
+
+```elixir
+defmodule Example.App do
+  use Application
+
+  def start(_type, _args) do
+    import Supervisor.Spec
+    tree = [supervisor(Verk.Supervisor, [])]
+    opts = [name: Simple.Sup, strategy: :one_for_one]
+    Supervisor.start_link(tree, opts)
+  end
 end
 ```
 

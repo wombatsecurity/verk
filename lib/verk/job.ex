@@ -1,9 +1,13 @@
 defmodule Verk.Job do
+  @moduledoc """
+  The Job struct
+  """
+
   use Verk.PoisonVersion
   @keys [error_message: nil, failed_at: nil, retry_count: 0, queue: nil, class: nil, args: [],
          jid: nil, finished_at: nil, enqueued_at: nil, retried_at: nil, error_backtrace: nil]
 
-  @derive { Poison.Encoder, only: Keyword.keys(@keys) }
+  @derive {Poison.Encoder, only: Keyword.keys(@keys)}
   defstruct [:original_json | @keys]
 
   @doc """
@@ -11,8 +15,8 @@ defmodule Verk.Job do
   """
   @spec decode!(binary) :: %__MODULE__{}
   def decode!(payload) do
-    job = decode!(payload, is_before_poison_2)
-    %Verk.Job{ job | original_json: payload }
+    job = decode!(payload, before_poison_2?)
+    %Verk.Job{job | original_json: payload}
   end
 
   def decode!(payload, true),  do: Poison.decode!(payload, as: __MODULE__)
