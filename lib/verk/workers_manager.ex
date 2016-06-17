@@ -212,7 +212,6 @@ defmodule Verk.WorkersManager do
   end
 
   defp ask_to_perform(worker, job_id, module, args) do
-    args = args ++ [job_id]
     Verk.Worker.perform_async(worker, self, module, args, job_id)
   end
 end
