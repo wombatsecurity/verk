@@ -8,9 +8,7 @@ defmodule Verk do
 
   It has an API that provides information about the queues
   """
-  alias Verk.Job
-  alias Timex.Time
-  alias Timex.DateTime
+  alias Verk.{Job, Time}
 
   @schedule_key "schedule"
 
@@ -46,8 +44,14 @@ defmodule Verk do
   def enqueue(job = %Job{queue: nil}, _redis), do: {:error, {:missing_queue, job}}
   def enqueue(job = %Job{class: nil}, _redis), do: {:error, {:missing_module, job}}
   def enqueue(job = %Job{args: args}, _redis) when not is_list(args), do: {:error, {:missing_args, job}}
-  def enqueue(job = %Job{jid: nil}, redis), do: enqueue(%Job{job | jid: generate_jid}, redis)
-  def enqueue(%Job{jid: jid, queue: queue} = job, redis) do
+  def enqueue(job = %Job{max_retry_count: nil}, redis) do
+    job = %Job{job | max_retry_count: Job.default_max_retry_count()}
+    enqueue(job, redis)
+  end
+  def enqueue(job = %Job{max_retry_count: count}, _redis) when not is_integer(count), do: {:error, {:invalid_max_retry_count, job}}
+  def enqueue(job = %Job{jid: nil}, redis), do: enqueue(%Job{job | jid: generate_jid()}, redis)
+  def enqueue(job = %Job{jid: jid, queue: queue}, redis) do
+    job = %Job{job | enqueued_at: Time.now |> DateTime.to_unix}
     case Redix.command(redis, ["LPUSH", "queue:#{queue}", Poison.encode!(job)]) do
       {:ok, _} -> {:ok, jid}
       {:error, reason} -> {:error, reason}
@@ -71,15 +75,14 @@ defmodule Verk do
   def schedule(job = %Job{class: nil}, %DateTime{}, _redis), do: {:error, {:missing_module, job}}
   def schedule(job = %Job{args: args}, %DateTime{}, _redis) when not is_list(args), do: {:error, {:missing_args, job}}
   def schedule(job = %Job{jid: nil}, perform_at = %DateTime{}, redis) do
-    schedule(%Job{job | jid: generate_jid}, perform_at, redis)
+    schedule(%Job{job | jid: generate_jid()}, perform_at, redis)
   end
-  def schedule(%Job{jid: jid} = job, %DateTime{} = perform_at, redis) do
-    perform_at_secs = DateTime.to_secs(perform_at)
-
-    if perform_at_secs < Time.now(:seconds) do
+  def schedule(job = %Job{jid: jid}, perform_at = %DateTime{}, redis) do
+    if Time.after?(Time.now, perform_at) do
+      #past time to do the job
       enqueue(job, redis)
     else
-      case Redix.command(redis, ["ZADD", @schedule_key, perform_at_secs, Poison.encode!(job)]) do
+      case Redix.command(redis, ["ZADD", @schedule_key, DateTime.to_unix(perform_at), Poison.encode!(job)]) do
         {:ok, _} -> {:ok, jid}
         {:error, reason} -> {:error, reason}
       end
@@ -87,7 +90,7 @@ defmodule Verk do
   end
 
   defp generate_jid do
-    <<part1::32, part2::32>> = :crypto.rand_bytes(8)
+    <<part1::32, part2::32>> = :crypto.strong_rand_bytes(8)
    "#{part1}#{part2}"
   end
 end

@@ -7,7 +7,7 @@ defmodule Verk.ScheduleManager do
 
   use GenServer
   require Logger
-  alias Timex.Time
+  alias Verk.Time
 
   @default_poll_interval 5000
   @schedule_key "schedule"
@@ -29,8 +29,7 @@ defmodule Verk.ScheduleManager do
   Connect to redis and timeout with the `poll_interval`
   """
   def init(_) do
-    {:ok, redis_url} = Application.fetch_env(:verk, :redis_url)
-    {:ok, redis} = Redix.start_link(redis_url)
+    {:ok, redis} = Redix.start_link(Confex.get_env(:verk, :redis_url))
     Verk.Scripts.load(redis)
 
     state = %State{redis: redis}
@@ -56,7 +55,8 @@ defmodule Verk.ScheduleManager do
   end
 
   defp handle_info(fetch_message, state, queue) do
-    case Redix.command(state.redis, ["EVALSHA", @enqueue_retriable_script_sha, 1, queue, Time.now(:seconds)]) do
+    now = Time.now |> DateTime.to_unix(:seconds)
+    case Redix.command(state.redis, ["EVALSHA", @enqueue_retriable_script_sha, 1, queue, now]) do
       {:ok, nil} ->
         schedule_fetch!(fetch_message)
         {:noreply, state}
@@ -74,10 +74,10 @@ defmodule Verk.ScheduleManager do
   end
 
   defp schedule_fetch!(fetch_message) do
-    interval = Application.get_env(:verk, :poll_interval, @default_poll_interval)
+    interval = Confex.get_env(:verk, :poll_interval, @default_poll_interval)
     schedule_fetch!(fetch_message, interval)
   end
   defp schedule_fetch!(fetch_message, interval) do
-    Process.send_after(self, fetch_message, interval)
+    Process.send_after(self(), fetch_message, interval)
   end
 end

@@ -7,10 +7,7 @@ defmodule Verk.WorkersManager do
 
   use GenServer
   require Logger
-  alias Verk.Events
-  alias Verk.Job
-  alias Verk.QueueManager
-  alias Verk.Log
+  alias Verk.{Events, Job, QueueManager, Log, Time}
 
   @default_timeout 1000
 
@@ -37,7 +34,7 @@ defmodule Verk.WorkersManager do
   List running jobs
 
   Example:
-      [%{process: #PID<0.186.0>, job: %Verk.Job{...}, started_at: %Timex.DateTime{...}} ]
+      [%{process: #PID<0.186.0>, job: %Verk.Job{...}, started_at: %DateTime{...}} ]
   """
   @spec running_jobs(binary | atom) :: Map.t
   def running_jobs(queue, limit \\ 100) do
@@ -75,7 +72,7 @@ defmodule Verk.WorkersManager do
   """
   def init([workers_manager_name, queue_name, queue_manager_name, pool_name, size]) do
     monitors = :ets.new(workers_manager_name, [:named_table, read_concurrency: true])
-    timeout = Application.get_env(:verk, :workers_manager_timeout, @default_timeout)
+    timeout = Confex.get_env(:verk, :workers_manager_timeout, @default_timeout)
     state = %State{queue_name: queue_name,
                   queue_manager_name: queue_manager_name,
                   pool_name: pool_name,
@@ -85,7 +82,7 @@ defmodule Verk.WorkersManager do
 
     Logger.info "Workers Manager started for queue #{queue_name}"
 
-    send self, :enqueue_inprogress
+    send self(), :enqueue_inprogress
     Verk.QueueStats.reset_started(queue_name)
 
     {:ok, state}
@@ -93,8 +90,13 @@ defmodule Verk.WorkersManager do
 
   @doc false
   def handle_info(:enqueue_inprogress, state) do
-    :ok = QueueManager.enqueue_inprogress(state.queue_manager_name)
-    {:noreply, state, 0}
+    case QueueManager.enqueue_inprogress(state.queue_manager_name) do
+      :ok ->
+        {:noreply, state, 0}
+      :more ->
+        send self(), :enqueue_inprogress
+        {:noreply, state}
+    end
   end
 
   def handle_info(:timeout, state) do
@@ -102,7 +104,14 @@ defmodule Verk.WorkersManager do
     if workers != 0 do
       case QueueManager.dequeue(state.queue_manager_name, workers) do
         jobs when is_list(jobs) ->
-          for job <- jobs, do: job |> Job.decode! |> start_job(state)
+          Enum.each(jobs, fn job ->
+            case job |> Job.decode do
+              {:ok, verk_job} -> start_job(verk_job, state)
+              {:error, error} ->
+                Logger.error("Failed to decode job, error: #{inspect error}, original job: #{inspect job}")
+                QueueManager.malformed(state.queue_manager_name, job)
+            end
+          end)
         reason ->
           Logger.error("Failed to fetch a job. Reason: #{inspect reason}")
       end
@@ -143,6 +152,7 @@ defmodule Verk.WorkersManager do
 
   defp handle_down!(mref, worker, reason, stack, state) do
     Logger.debug "Worker got down, reason: #{inspect reason}, #{inspect([mref, worker])}"
+    :ok = :poolboy.checkin(state.pool_name, worker)
     case :ets.lookup(state.monitors, worker) do
       [{^worker, _job_id, job, ^mref, start_time}] ->
         exception = RuntimeError.exception(inspect(reason))
@@ -153,6 +163,7 @@ defmodule Verk.WorkersManager do
 
   @doc false
   def handle_cast({:done, worker, job_id}, state) do
+    :ok = :poolboy.checkin(state.pool_name, worker)
     case :ets.lookup(state.monitors, worker) do
       [{^worker, ^job_id, job, mref, start_time}] ->
         succeed(job, start_time, worker, mref, state.monitors, state.queue_manager_name)
@@ -163,6 +174,7 @@ defmodule Verk.WorkersManager do
 
   def handle_cast({:failed, worker, job_id, exception, stacktrace}, state) do
     Logger.debug "Job failed reason: #{inspect exception}"
+    :ok = :poolboy.checkin(state.pool_name, worker)
     case :ets.lookup(state.monitors, worker) do
       [{^worker, ^job_id, job, mref, start_time}] ->
         fail(job, start_time, worker, mref, state.monitors, state.queue_manager_name, exception, stacktrace)
@@ -175,7 +187,9 @@ defmodule Verk.WorkersManager do
     QueueManager.ack(queue_manager_name, job)
     Log.done(job, start_time, worker)
     demonitor!(monitors, worker, mref)
-    notify!(%Events.JobFinished{job: job, finished_at: Timex.DateTime.now})
+    finished_at = Time.now
+    job = %{job | finished_at: finished_at}
+    notify!(%Events.JobFinished{job: job, started_at: start_time, finished_at: finished_at})
   end
 
   defp fail(job, start_time, worker, mref, monitors, queue_manager_name, exception, stacktrace) do
@@ -183,7 +197,8 @@ defmodule Verk.WorkersManager do
     demonitor!(monitors, worker, mref)
     :ok = QueueManager.retry(queue_manager_name, job, exception, stacktrace)
     :ok = QueueManager.ack(queue_manager_name, job)
-    notify!(%Events.JobFailed{job: job, failed_at: Timex.DateTime.now, exception: exception, stacktrace: stacktrace})
+    notify!(%Events.JobFailed{job: job, started_at: start_time, failed_at: Time.now,
+                              exception: exception, stacktrace: stacktrace})
   end
 
   defp start_job(job, state) do
@@ -191,8 +206,8 @@ defmodule Verk.WorkersManager do
       worker when is_pid(worker) ->
         monitor!(state.monitors, worker, job)
         Log.start(job, worker)
-        Verk.Worker.perform_async(worker, self, job)
-        notify!(%Events.JobStarted{job: job, started_at: Timex.DateTime.now})
+        Verk.Worker.perform_async(worker, self(), job)
+        notify!(%Events.JobStarted{job: job, started_at: Time.now})
     end
   end
 
@@ -203,7 +218,7 @@ defmodule Verk.WorkersManager do
 
   defp monitor!(monitors, worker, job = %Job{jid: job_id}) do
     mref = Process.monitor(worker)
-    now = Timex.DateTime.now
+    now = Time.now
     true = :ets.insert(monitors, {worker, job_id, job, mref, now})
   end
 
@@ -214,7 +229,7 @@ defmodule Verk.WorkersManager do
   end
 
   defp notify!(event) do
-    :ok = GenEvent.ack_notify(Verk.EventManager, event)
+    :ok = Verk.EventProducer.async_notify(event)
   end
 
   defp free_workers(pool_name) do

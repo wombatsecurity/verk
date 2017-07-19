@@ -18,15 +18,15 @@ Verk will hold one connection to Redis per queue plus one dedicated to the `Sche
 
 The `ScheduleManager` fetches jobs from the `retry` set to be enqueued back to the original queue when it's ready to be retried.
 
-It also has one GenEvent manager called `EventManager`.
+It also has one GenStage producer called `Verk.EventProducer`.
 
 The image below is an overview of Verk's supervision tree running with a queue named `default` having 5 workers.
 
-![Supervision Tree](http://i.imgur.com/8BW8D04.png)
+![Supervision Tree](http://i.imgur.com/ATsNAvJ.png)
 
 Feature set:
 
-* Retry mechanism
+* Retry mechanism with exponential backoff
 * Dynamic addition/removal of queues
 * Reliable job processing (RPOPLPUSH and Lua scripts to the rescue)
 * Error and event tracking
@@ -37,7 +37,7 @@ First, add Verk to your `mix.exs` dependencies:
 
 ```elixir
 def deps do
-  [{:verk, "~> 0.12"}]
+  [{:verk, "~> 0.14"}]
 end
 ```
 
@@ -82,13 +82,13 @@ end
 This job can be enqueued using `Verk.enqueue/1`:
 
 ```elixir
-Verk.enqueue(%Verk.Job{queue: :default, class: "ExampleWorker", args: [1,2]})
+Verk.enqueue(%Verk.Job{queue: :default, class: "ExampleWorker", args: [1,2], max_retry_count: 5})
 ```
 
 This job can also be scheduled using `Verk.schedule/2`:
 
  ```elixir
- perform_at = Timex.shift(Timex.DateTime.now, seconds: 30)
+ perform_at = Timex.shift(Timex.now, seconds: 30)
  Verk.schedule(%Verk.Job{queue: :default, class: "ExampleWorker", args: [1,2]}, perform_at)
  ```
 
@@ -100,12 +100,27 @@ The queue `default` will have a maximum of 25 jobs being processed at a time and
 
 ```elixir
 config :verk, queues: [default: 25, priority: 10],
+              max_retry_count: 10,
               poll_interval: 5000,
+              start_job_log_level: :info,
+              done_job_log_level: :info,
+              fail_job_log_level: :info,
               node_id: "1",
               redis_url: "redis://127.0.0.1:6379"
 ```
 
-The configuration for releases is still a work in progress.
+Verk supports the convention `{:system, "ENV_NAME", default}` for reading environment configuration at runtime using [Confex](https://hexdocs.pm/confex/readme.html):
+
+```elixir
+config :verk, queues: [default: 25, priority: 10],
+              max_retry_count: 10,
+              poll_interval: {:system, :integer, "VERK_POLL_INTERVAL", 5000},
+              start_job_log_level: :info,
+              done_job_log_level: :info,
+              fail_job_log_level: :info,
+              node_id: "1",
+              redis_url: {:system, "VERK_REDIS_URL", "redis://127.0.0.1:6379"}
+```
 
 ## Queues
 
@@ -131,55 +146,61 @@ The jobs that will run on top of Verk should be idempotent as they may run more 
 
 One can track when jobs start and finish or fail. This can be useful to build metrics around the jobs. The `QueueStats` handler does some kind of metrics using these events: https://github.com/edgurgel/verk/blob/master/lib/verk/queue_stats.ex
 
-Verk has an Event Manager that notify the following events:
+Verk has an Event Manager that notifies the following events:
 
 * `Verk.Events.JobStarted`
 * `Verk.Events.JobFinished`
 * `Verk.Events.JobFailed`
 
-Here is an example of a `GenEvent` handler to print any event:
-
-```elixir
-defmodule PrintHandler do
-  use GenEvent
-
-  def handle_event(event, state) do
-    IO.puts "Event received: #{inspect event}"
-    { :ok, state }
-  end
-end
-```
-
 One can define an error tracking handler like this:
 
 ```elixir
 defmodule TrackingErrorHandler do
-  use GenEvent
+  use GenStage
 
-  def handle_event(%Verk.Events.JobFailed{job: job, failed_at: failed_at, stacktrace: trace}, state) do
-    MyTrackingExceptionSystem.track(stacktrace: trace, name: job.class)
-    { :ok, state }
+  def start_link() do
+    GenStage.start_link(__MODULE__, :ok)
   end
-  def handle_event(_, state) do
-    # Ignore other events
-    { :ok, state }
+
+  def init(_) do
+    filter = fn event -> event.__struct__ == Verk.Events.JobFailed end
+    {:consumer, :state, subscribe_to: [{Verk.EventProducer, selector: filter}]}
+  end
+
+  def handle_events(events, _from, state) do
+    Enum.each(events, &handle_event/1)
+    {:noreply, [], state}
+  end
+
+  defp handle_event(%Verk.Events.JobFailed{job: job, failed_at: failed_at, stacktrace: trace}) do
+    MyTrackingExceptionSystem.track(stacktrace: trace, name: job.class)
   end
 end
 ```
 
-You also need to add the handler to connect with the event manager:
+Notice the selector to get just the type JobFailed. If no selector is set every event is sent.
 
-```elixir
-GenEvent.add_mon_handler(Verk.EventManager, TrackingErrorHandler, [])
-```
+Then adding the consumer to your supervision tree:
 
-More info about `GenEvent.add_mon_handler/3` [here](http://elixir-lang.org/docs/v1.1/elixir/GenEvent.html#add_mon_handler/3).
+  ```elixir
+  defmodule Example.App do
+    use Application
+
+    def start(_type, _args) do
+      import Supervisor.Spec
+      tree = [supervisor(Verk.Supervisor, []),
+              worker(TrackingErrorHandler, [])]
+      opts = [name: Simple.Sup, strategy: :one_for_one]
+      Supervisor.start_link(tree, opts)
+    end
+  end
+  ```
 
 ## Dashboard ?
 
 Check [Verk Web](https://github.com/edgurgel/verk_web)!
 
-![](http://i.imgur.com/AclG57m.png)
+![Dashboard](http://i.imgur.com/LsDKIVT.png)
 
 ## Sponsorship
 

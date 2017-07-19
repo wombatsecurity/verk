@@ -2,8 +2,8 @@ defmodule Verk.Supervisor do
   @moduledoc """
   Supervisor definition for Verk application. It consists of:
   * `Verk.ScheduleManager`
-  * GenEvent manager named `Verk.EventManager`
-  * Watcher of the handler `Verk.QueueStats`
+  * GenStage producer named `Verk.EventProducer`
+  * GenStage consumer `Verk.QueueStats`
   * Redis connectionn named `Verk.Redis`
   * A `Verk.Queue.Supervisor` per queue
   """
@@ -16,17 +16,18 @@ defmodule Verk.Supervisor do
 
   @doc false
   def init(_) do
-    queues = Application.get_env(:verk, :queues, [])
+    queues = Confex.get_env(:verk, :queues, [])
     children = for {queue, size} <- queues, do: queue_child(queue, size)
 
-    {:ok, redis_url} = Application.fetch_env(:verk, :redis_url)
+    redis_url = Confex.get_env(:verk, :redis_url)
 
-    schedule_manager    = worker(Verk.ScheduleManager, [], id: :schedule_manager)
-    verk_event_manager  = worker(GenEvent, [[name: Verk.EventManager]])
-    queue_stats_watcher = worker(Watcher, [Verk.EventManager, Verk.QueueStats, []])
-    redis               = worker(Redix, [redis_url, [name: Verk.Redis]])
+    schedule_manager = worker(Verk.ScheduleManager, [], id: Verk.ScheduleManager)
+    event_producer   = worker(Verk.EventProducer, [])
 
-    children = [redis, verk_event_manager, queue_stats_watcher, schedule_manager] ++ children
+    queue_stats = worker(Verk.QueueStats, [])
+    redis       = worker(Redix, [redis_url, [name: Verk.Redis]], id: Verk.Redis)
+
+    children = [redis, event_producer, queue_stats, schedule_manager] ++ children
     supervise(children, strategy: :one_for_one)
   end
 
